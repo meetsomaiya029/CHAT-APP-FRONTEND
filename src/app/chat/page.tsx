@@ -4,6 +4,8 @@ import { useEffect, useState, useRef, UIEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import { io, Socket } from 'socket.io-client';
 
+import { API_BASE_URL } from '../../../config'; 
+
 const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -67,7 +69,7 @@ export default function ChatPage() {
     const parsedUser = JSON.parse(storedUser);
     setUser(parsedUser);
 
-    const newSocket = io('https://my-chat-app29.duckdns.org', { auth: { token } });
+    const newSocket = io(API_BASE_URL, { auth: { token } });
     setSocket(newSocket);
 
     fetchRooms();
@@ -152,7 +154,7 @@ export default function ChatPage() {
   const fetchRooms = async () => {
     try {
       const token = localStorage.getItem('token');
-      const res = await fetch('https://my-chat-app29.duckdns.org/api/api/chat/rooms', {
+      const res = await fetch(`${API_BASE_URL}/api/api/chat/rooms`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
@@ -170,7 +172,7 @@ export default function ChatPage() {
 
     try {
       const token = localStorage.getItem('token');
-      const res = await fetch('https://my-chat-app29.duckdns.org/api/api/chat/rooms', {
+      const res = await fetch(`${API_BASE_URL}/api/api/chat/rooms`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -193,7 +195,7 @@ export default function ChatPage() {
     try {
       const token = localStorage.getItem('token');
       const res = await fetch(
-        `https://my-chat-app29.duckdns.org/api/api/chat/rooms/${roomId}/messages?limit=20`,
+        `${API_BASE_URL}/api/api/chat/rooms/${roomId}/messages?limit=20`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
@@ -225,7 +227,7 @@ export default function ChatPage() {
     try {
       const token = localStorage.getItem('token');
       const res = await fetch(
-        `https://my-chat-app29.duckdns.org/api/apichat/rooms/${currentRoom.id}/messages?cursor=${firstMessageId}&limit=20`,
+        `${API_BASE_URL}/api/apichat/rooms/${currentRoom.id}/messages?cursor=${firstMessageId}&limit=20`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
@@ -251,7 +253,7 @@ export default function ChatPage() {
       }
     } catch (err) {
       console.error('Failed to load older messages', err);
-    } finally {
+    } fontinally {
       setIsLoadingMore(false);
     }
   };
@@ -326,7 +328,7 @@ export default function ChatPage() {
       const token = localStorage.getItem('token');
       const currentUserId = user?.id || localStorage.getItem('userId');
 
-      const res = await fetch(`https://my-chat-app29.duckdns.org/api/api/chat/messages/${messageId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/api/chat/messages/${messageId}`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -369,7 +371,7 @@ export default function ChatPage() {
       const token = localStorage.getItem('token');
       const currentUserId = user?.id || localStorage.getItem('userId');
 
-      const res = await fetch(`https://my-chat-app29.duckdns.org/api/api/chat/messages/${messageId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/api/chat/messages/${messageId}`, {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
