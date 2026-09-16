@@ -4,36 +4,15 @@ import { useEffect, useState, useRef, UIEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import { io, Socket } from 'socket.io-client';
 
-import { API_BASE_URL } from '../../../config';
+import { API_BASE_URL } from '../../../config'; 
 
-// Configuration with STUN and TURN Relays for strict NAT/firewall traversal
-const ICE_SERVERS: RTCConfiguration = {
+const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
-    {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
   ],
 };
-
-interface RemotePeer {
-  stream: MediaStream;
-  userName: string;
-}
 
 export default function ChatPage() {
   const [user, setUser] = useState<any>(null);
@@ -58,21 +37,15 @@ export default function ChatPage() {
   const [showMobileRooms, setShowMobileRooms] = useState(true);
   const [showMobileMembers, setShowMobileMembers] = useState(false);
 
-  // WebRTC Multi-User State
+  // WebRTC State
   const [isInCall, setIsInCall] = useState(false);
-  const [showMediaModal, setShowMediaModal] = useState(false); // Modal for camera preference choice
-  const [remoteStreams, setRemoteStreams] = useState<Record<string, RemotePeer>>({});
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [remoteUserName, setRemoteUserName] = useState<string>('Remote Peer');
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
-
-  // Dedicated Map to hold reference to remote video DOM nodes for reliable playback binding
-  const remoteVideoRefs = useRef<{ [key: string]: HTMLVideoElement | null }>({});
-
-  // WebRTC Peer References
-  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  
-  // Bulletproof Global ICE Queue: stores incoming candidates per senderSocketId even if PC isn't created yet!
-  const incomingIceCandidatesBufferRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  const iceCandidatesQueueRef = useRef<RTCIceCandidateInit[]>([]);
 
   // Media Controls State
   const [isMuted, setIsMuted] = useState(false);
@@ -83,206 +56,6 @@ export default function ChatPage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const router = useRouter();
-
-  // Helper function to cleanly remove a specific peer's connection and stream
-  const removePeer = (targetSocketId: string) => {
-    console.log(`[WebRTC] Removing peer and cleaning up resources for: ${targetSocketId}`);
-    
-    const pc = peerConnectionsRef.current.get(targetSocketId);
-    if (pc) {
-      pc.close();
-      peerConnectionsRef.current.delete(targetSocketId);
-    }
-
-    incomingIceCandidatesBufferRef.current.delete(targetSocketId);
-    delete remoteVideoRefs.current[targetSocketId];
-
-    setRemoteStreams((prev) => {
-      const updated = { ...prev };
-      delete updated[targetSocketId];
-      return updated;
-    });
-  };
-
-  // Helper to flush queued candidates safely into an active peer connection
-  const flushQueuedIceCandidates = async (targetSocketId: string, pc: RTCPeerConnection) => {
-    if (!pc.remoteDescription || !pc.remoteDescription.type) {
-      return;
-    }
-    const queue = incomingIceCandidatesBufferRef.current.get(targetSocketId);
-    if (queue && queue.length > 0) {
-      while (queue.length > 0) {
-        const candidate = queue.shift();
-        if (candidate) {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          } catch (e) {
-            console.error('[WebRTC] Error adding buffered ICE candidate:', e);
-          }
-        }
-      }
-    }
-  };
-
-  // Acquire local stream based on user's choice (video + audio vs audio-only)
-  const initializeLocalStream = async (withVideo: boolean): Promise<MediaStream> => {
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(t => t.stop());
-    }
-
-    try {
-      const constraints: MediaStreamConstraints = {
-        video: withVideo ? { width: { ideal: 1280 }, height: { ideal: 720 } } : false,
-        audio: true,
-      };
-
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      localStreamRef.current = stream;
-      setIsInCall(true);
-      setIsVideoOff(!withVideo);
-      setShowMediaModal(false);
-      return stream;
-    } catch (err) {
-      console.warn('[WebRTC] Failed with requested settings, falling back to audio-only...', err);
-      const audioStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
-      localStreamRef.current = audioStream;
-      setIsInCall(true);
-      setIsVideoOff(true);
-      setShowMediaModal(false);
-      return audioStream;
-    }
-  };
-
-  // Helper function to create peer connections with polite/impolite collision handling & consistent ordering
-  const createPeerConnection = (
-    targetSocketId: string,
-    targetUserName: string,
-    activeSocket: Socket,
-    currentUser: any,
-    roomId: string
-  ) => {
-    if (peerConnectionsRef.current.has(targetSocketId)) {
-      return peerConnectionsRef.current.get(targetSocketId)!;
-    }
-
-    const pc = new RTCPeerConnection(ICE_SERVERS);
-    peerConnectionsRef.current.set(targetSocketId, pc);
-
-    // 1. Capture incoming remote tracks safely
-    pc.ontrack = (event) => {
-      console.log(`[WebRTC] ontrack fired from ${targetSocketId}`, event);
-      event.track.enabled = true;
-
-      setRemoteStreams((prev) => {
-        let existing = prev[targetSocketId];
-        let stream = existing ? existing.stream : new MediaStream();
-
-        if (!stream.getTracks().some((t) => t.id === event.track.id)) {
-          stream.addTrack(event.track);
-        }
-
-        return {
-          ...prev,
-          [targetSocketId]: { stream, userName: targetUserName },
-        };
-      });
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
-        removePeer(targetSocketId);
-      }
-    };
-
-    // 2. Attach local tracks uniformly
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        const senders = pc.getSenders();
-        const exists = senders.some((s) => s.track === track);
-        if (!exists) {
-          pc.addTrack(track, localStreamRef.current!);
-        }
-      });
-    }
-
-    // 3. ICE candidate handling
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        activeSocket.emit('webrtc_ice_candidate', {
-          roomId,
-          targetSocketId,
-          candidate: event.candidate,
-          senderSocketId: activeSocket.id,
-          senderId: currentUser.id,
-        });
-      }
-    };
-
-    // 4. Polite/Impolite check to prevent race conditions & SDP m-line order crashes
-    const isPolite = activeSocket.id < targetSocketId;
-    let makingOffer = false;
-    let ignoreOffer = false;
-
-    pc.onnegotiationneeded = async () => {
-      try {
-        makingOffer = true;
-        await pc.setLocalDescription();
-        activeSocket.emit('webrtc_offer', {
-          roomId,
-          targetSocketId,
-          offer: pc.localDescription,
-          senderSocketId: activeSocket.id,
-          senderId: currentUser.id,
-          senderName: currentUser.name,
-        });
-      } catch (err) {
-        console.error('[WebRTC] Negotiation failed:', err);
-      } finally {
-        makingOffer = false;
-      }
-    };
-
-    // Attach custom handleOffer method to manage glare gracefully
-    (pc as any).handleOffer = async (offer: any) => {
-      const offerCollision = makingOffer || pc.signalingState !== 'stable';
-      ignoreOffer = !isPolite && offerCollision;
-
-      if (ignoreOffer) return;
-
-      if (offerCollision) {
-        await pc.setLocalDescription({ type: 'rollback' });
-      }
-
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => {
-          const senders = pc.getSenders();
-          const exists = senders.some((s) => s.track === track);
-          if (!exists) {
-            pc.addTrack(track, localStreamRef.current!);
-          }
-        });
-      }
-
-      await flushQueuedIceCandidates(targetSocketId, pc);
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      activeSocket.emit('webrtc_answer', {
-        roomId,
-        targetSocketId,
-        answer: pc.localDescription,
-        senderSocketId: activeSocket.id,
-        senderId: currentUser.id,
-        senderName: currentUser.name,
-      });
-    };
-
-    flushQueuedIceCandidates(targetSocketId, pc);
-    return pc;
-  };
 
   useEffect(() => {
     const token = localStorage.getItem('token');
@@ -318,74 +91,33 @@ export default function ChatPage() {
 
     newSocket.on('room_users', (users: any[]) => {
       setRoomMembers(users);
-
-      const activeSocketIds = new Set(users.map((u) => u.socketId));
-      peerConnectionsRef.current.forEach((_, socketId) => {
-        if (!activeSocketIds.has(socketId)) {
-          removePeer(socketId);
-        }
-      });
     });
 
-    // --- WEBRTC SIGNALING HANDLERS ---
+    // WebRTC Signaling Listeners
+    newSocket.on('webrtc_offer', async ({ offer, senderName }) => {
+      if (senderName) setRemoteUserName(senderName);
+      await handleIncomingOffer(offer, newSocket);
+    });
 
-    newSocket.on('user_started_call', async ({ callerSocketId, callerUserName, roomId, callerId }) => {
-      if (callerSocketId !== newSocket.id && callerId !== parsedUser.id) {
-        try {
-          if (!localStreamRef.current) {
-            // Default to audio-only if incoming call and no local stream established yet, or user can toggle cam later
-            const audioStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
-            localStreamRef.current = audioStream;
-            setIsInCall(true);
-            setIsVideoOff(true);
+    newSocket.on('webrtc_answer', async ({ answer, senderName }) => {
+      if (senderName) setRemoteUserName(senderName);
+      if (peerConnectionRef.current) {
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+
+        while (iceCandidatesQueueRef.current.length > 0) {
+          const candidate = iceCandidatesQueueRef.current.shift();
+          if (candidate) {
+            await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
           }
-          createPeerConnection(callerSocketId, callerUserName || 'Peer', newSocket, parsedUser, roomId);
-        } catch (err) {
-          console.error('[WebRTC] Error handling user_started_call:', err);
         }
       }
     });
 
-    newSocket.on('user_ended_call', ({ socketId }: { socketId: string }) => {
-      removePeer(socketId);
-    });
-
-    newSocket.on('webrtc_offer', async ({ offer, senderSocketId, senderName, roomId, senderId }) => {
-      if (senderId === parsedUser.id || senderSocketId === newSocket.id) return;
-
-      try {
-        const pc = createPeerConnection(senderSocketId, senderName || 'Peer', newSocket, parsedUser, roomId);
-        await (pc as any).handleOffer(offer);
-      } catch (err) {
-        console.error('[WebRTC] Error handling WebRTC offer:', err);
-      }
-    });
-
-    newSocket.on('webrtc_answer', async ({ answer, senderSocketId, senderId }) => {
-      if (senderId === parsedUser.id || senderSocketId === newSocket.id) return;
-
-      const pc = peerConnectionsRef.current.get(senderSocketId);
-      if (pc) {
-        await pc.setRemoteDescription(new RTCSessionDescription(answer));
-        await flushQueuedIceCandidates(senderSocketId, pc);
-      }
-    });
-
-    newSocket.on('webrtc_ice_candidate', async ({ candidate, senderSocketId, senderId }) => {
-      if (senderId === parsedUser.id || senderSocketId === newSocket.id) return;
-
-      const pc = peerConnectionsRef.current.get(senderSocketId);
-
-      if (pc && pc.remoteDescription && pc.remoteDescription.type) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) {
-          console.error('[WebRTC] Error adding incoming ICE candidate directly:', e);
-        }
+    newSocket.on('webrtc_ice_candidate', async ({ candidate }) => {
+      if (peerConnectionRef.current && peerConnectionRef.current.remoteDescription) {
+        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
       } else {
-        const existingQueue = incomingIceCandidatesBufferRef.current.get(senderSocketId) || [];
-        existingQueue.push(candidate);
-        incomingIceCandidatesBufferRef.current.set(senderSocketId, existingQueue);
+        iceCandidatesQueueRef.current.push(candidate);
       }
     });
 
@@ -394,32 +126,22 @@ export default function ChatPage() {
     };
   }, []);
 
+  // Sync local media stream whenever video DOM element mounts
   useEffect(() => {
     if (isInCall && localStreamRef.current && localVideoRef.current) {
       localVideoRef.current.srcObject = localStreamRef.current;
     }
-  }, [isInCall, isVideoOff]);
+  }, [isInCall]);
 
+  // Sync remote media stream whenever video DOM element mounts or stream updates
   useEffect(() => {
-    Object.entries(remoteStreams).forEach(([socketId, { stream }]) => {
-      const videoEl = remoteVideoRefs.current[socketId];
-      if (videoEl) {
-        if (videoEl.srcObject !== stream) {
-          videoEl.srcObject = stream;
-        }
-        
-        stream.getTracks().forEach((track) => {
-          track.enabled = true;
-        });
-
-        videoEl.play().catch((err) => {
-          console.warn('[WebRTC] Autoplay error, retrying muted:', err);
-          videoEl.muted = true;
-          videoEl.play().catch((e) => console.error('[WebRTC] Fatal playback error:', e));
-        });
-      }
-    });
-  }, [remoteStreams]);
+    if (isInCall && remoteStream && remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = remoteStream;
+      remoteVideoRef.current
+        .play()
+        .catch((err) => console.error('Error auto-playing remote video:', err));
+    }
+  }, [isInCall, remoteStream]);
 
   const scrollToBottom = () => {
     setTimeout(() => {
@@ -432,7 +154,7 @@ export default function ChatPage() {
   const fetchRooms = async () => {
     try {
       const token = localStorage.getItem('token');
-      const res = await fetch(`${API_BASE_URL}/api/chat/rooms`, {
+      const res = await fetch(`${API_BASE_URL}/api/api/chat/rooms`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
@@ -450,7 +172,7 @@ export default function ChatPage() {
 
     try {
       const token = localStorage.getItem('token');
-      const res = await fetch(`${API_BASE_URL}/api/chat/rooms`, {
+      const res = await fetch(`${API_BASE_URL}/api/api/chat/rooms`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -468,12 +190,14 @@ export default function ChatPage() {
     }
   };
 
+  // Fetch Initial Room Messages with Pagination Support
   const fetchRoomMessages = async (roomId: string) => {
     try {
       const token = localStorage.getItem('token');
-      const res = await fetch(`${API_BASE_URL}/api/chat/rooms/${roomId}/messages?limit=20`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await fetch(
+        `${API_BASE_URL}/api/api/chat/rooms/${roomId}/messages?limit=20`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
 
       if (res.ok) {
         const data = await res.json();
@@ -491,6 +215,7 @@ export default function ChatPage() {
     }
   };
 
+  // Fetch Older Messages On Scroll Top
   const loadMoreMessages = async () => {
     if (!currentRoom || isLoadingMore || !hasMoreMessages || messages.length === 0) return;
 
@@ -502,7 +227,7 @@ export default function ChatPage() {
     try {
       const token = localStorage.getItem('token');
       const res = await fetch(
-        `${API_BASE_URL}/api/chat/rooms/${currentRoom.id}/messages?cursor=${firstMessageId}&limit=20`,
+        `${API_BASE_URL}/api/apichat/rooms/${currentRoom.id}/messages?cursor=${firstMessageId}&limit=20`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
@@ -519,6 +244,7 @@ export default function ChatPage() {
 
         setMessages((prev) => [...formatted, ...prev]);
 
+        // Retain scroll position relative to previous top content
         setTimeout(() => {
           if (scrollContainer) {
             scrollContainer.scrollTop = scrollContainer.scrollHeight - previousScrollHeight;
@@ -527,7 +253,7 @@ export default function ChatPage() {
       }
     } catch (err) {
       console.error('Failed to load older messages', err);
-    } finally {
+    } finally{
       setIsLoadingMore(false);
     }
   };
@@ -538,18 +264,13 @@ export default function ChatPage() {
     }
   };
 
-  const joinRoom = async (room: any) => {
-    if (isInCall) {
-      endCall();
-    }
-
+  const joinRoom = (room: any) => {
     setCurrentRoom(room);
     setMessages([]);
     setHasMoreMessages(true);
     setShowMobileRooms(false);
     setShowMobileMembers(false);
     fetchRoomMessages(room.id);
-
     socket?.emit('join_room', {
       roomId: room.id,
       userId: user?.id,
@@ -599,6 +320,7 @@ export default function ChatPage() {
     }
   };
 
+  // Edit Message Handler
   const handleSaveEdit = async (messageId: string) => {
     if (!editingContent.trim() || !currentRoom?.id) return;
 
@@ -606,13 +328,13 @@ export default function ChatPage() {
       const token = localStorage.getItem('token');
       const currentUserId = user?.id || localStorage.getItem('userId');
 
-      const res = await fetch(`${API_BASE_URL}/api/chat/messages/${messageId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/api/chat/messages/${messageId}`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({
+        body: JSON.stringify({ 
           content: editingContent,
           userId: currentUserId,
         }),
@@ -632,12 +354,15 @@ export default function ChatPage() {
 
         setEditingMessageId(null);
         setEditingContent('');
+      } else {
+        console.error('Edit request failed with status:', res.status);
       }
     } catch (err) {
       console.error('Failed to edit message:', err);
     }
   };
 
+  // Delete Message Handler
   const handleDeleteMessage = async (messageId: string) => {
     if (!currentRoom?.id) return;
     if (!confirm('Are you sure you want to delete this message?')) return;
@@ -646,7 +371,7 @@ export default function ChatPage() {
       const token = localStorage.getItem('token');
       const currentUserId = user?.id || localStorage.getItem('userId');
 
-      const res = await fetch(`${API_BASE_URL}/api/chat/messages/${messageId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/api/chat/messages/${messageId}`, {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
@@ -656,17 +381,23 @@ export default function ChatPage() {
       });
 
       if (res.ok) {
-        setMessages((prevMessages) => prevMessages.filter((msg) => msg.id !== messageId));
+        setMessages((prevMessages) =>
+          prevMessages.filter((msg) => msg.id !== messageId)
+        );
 
         socket?.emit('delete_message', {
           roomId: currentRoom.id,
           messageId,
         });
+      } else {
+        console.error('Delete request failed with status:', res.status);
       }
     } catch (err) {
       console.error('Failed to delete message:', err);
     }
   };
+
+  // --- WEBRTC & MEDIA CONTROL METHODS ---
 
   const toggleAudio = () => {
     if (localStreamRef.current) {
@@ -688,54 +419,98 @@ export default function ChatPage() {
     }
   };
 
-  const startCall = async (withVideo: boolean) => {
+  const initPeerConnection = (activeSocket: Socket) => {
+    const pc = new RTCPeerConnection(ICE_SERVERS);
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate && currentRoom) {
+        activeSocket.emit('webrtc_ice_candidate', {
+          roomId: currentRoom.id,
+          candidate: event.candidate,
+          senderId: user.id,
+        });
+      }
+    };
+
+    pc.ontrack = (event) => {
+      if (event.streams && event.streams[0]) {
+        setRemoteStream(event.streams[0]);
+      }
+    };
+
+    peerConnectionRef.current = pc;
+    return pc;
+  };
+
+  const startCall = async () => {
     if (!socket || !currentRoom) return;
 
     try {
-      const stream = await initializeLocalStream(withVideo);
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStreamRef.current = stream;
 
-      socket.emit('start_call', {
+      setIsInCall(true);
+
+      const pc = initPeerConnection(socket);
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      socket.emit('webrtc_offer', {
         roomId: currentRoom.id,
-        userId: user?.id,
-        userName: user?.name,
-        socketId: socket.id,
-      });
-
-      roomMembers.forEach((member) => {
-        if (member.userId !== user?.id && member.socketId && member.socketId !== socket.id) {
-          const pc = createPeerConnection(member.socketId, member.userName, socket, user, currentRoom.id);
-          stream.getTracks().forEach((track) => {
-            const senders = pc.getSenders();
-            const exists = senders.some((s) => s.track === track);
-            if (!exists) {
-              pc.addTrack(track, stream);
-            }
-          });
-        }
+        offer,
+        senderId: user.id,
+        senderName: user.name,
       });
     } catch (err) {
-      console.error('[WebRTC] Failed to start call:', err);
+      console.error('Failed to access media devices', err);
+    }
+  };
+
+  const handleIncomingOffer = async (offer: any, activeSocket: Socket) => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStreamRef.current = stream;
+
+      setIsInCall(true);
+
+      const pc = initPeerConnection(activeSocket);
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+
+      while (iceCandidatesQueueRef.current.length > 0) {
+        const candidate = iceCandidatesQueueRef.current.shift();
+        if (candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+      }
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      activeSocket.emit('webrtc_answer', {
+        roomId: currentRoom?.id,
+        answer,
+        senderId: user?.id,
+        senderName: user?.name,
+      });
+    } catch (err) {
+      console.error('Error answering WebRTC offer', err);
     }
   };
 
   const endCall = () => {
-    if (socket && currentRoom) {
-      socket.emit('end_call', { roomId: currentRoom.id, socketId: socket.id });
-    }
-
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
-    localStreamRef.current = null;
-
-    peerConnectionsRef.current.forEach((pc) => pc.close());
-    peerConnectionsRef.current.clear();
-    incomingIceCandidatesBufferRef.current.clear();
-    remoteVideoRefs.current = {};
-
-    setRemoteStreams({});
+    peerConnectionRef.current?.close();
+    peerConnectionRef.current = null;
+    iceCandidatesQueueRef.current = [];
+    setRemoteStream(null);
+    setRemoteUserName('Remote Peer');
     setIsInCall(false);
     setIsMuted(false);
     setIsVideoOff(false);
-    setShowMediaModal(false);
   };
 
   return (
@@ -868,7 +643,7 @@ export default function ChatPage() {
 
                   {!isInCall ? (
                     <button
-                      onClick={() => setShowMediaModal(true)}
+                      onClick={startCall}
                       className="bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-1.5 md:py-2 rounded-lg text-xs md:text-sm font-semibold transition shadow-lg shadow-emerald-950/50"
                     >
                       Start Call
@@ -884,87 +659,36 @@ export default function ChatPage() {
                 </div>
               </div>
 
-              {/* Media Choice Modal */}
-              {showMediaModal && (
-                <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 max-w-sm w-full shadow-2xl text-center space-y-4">
-                    <h3 className="text-lg font-bold text-amber-400">Choose Call Mode</h3>
-                    <p className="text-xs text-slate-400">
-                      Would you like to share your webcam or join with audio only (mic only)? You will still be able to see other participants.
-                    </p>
-                    <div className="flex flex-col gap-2 pt-2">
-                      <button
-                        onClick={() => startCall(true)}
-                        className="w-full bg-emerald-600 hover:bg-emerald-500 text-white py-2.5 rounded-lg text-sm font-semibold transition"
-                      >
-                        📹 Share Camera & Mic
-                      </button>
-                      <button
-                        onClick={() => startCall(false)}
-                        className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 py-2.5 rounded-lg text-sm font-semibold transition"
-                      >
-                        🎙️ Audio Only (Mic Only)
-                      </button>
-                      <button
-                        onClick={() => setShowMediaModal(false)}
-                        className="w-full text-xs text-slate-500 hover:text-slate-300 py-1.5 mt-1"
-                      >
-                        Cancel
-                      </button>
-                    </div>
+              {/* Video Call Viewports */}
+              {isInCall && (
+                <div className="p-3 bg-black border-b border-slate-800 grid grid-cols-1 sm:grid-cols-2 gap-3 h-60 sm:h-64 shrink-0">
+                  <div className="relative bg-slate-900 rounded-lg overflow-hidden border border-slate-800">
+                    <video
+                      ref={localVideoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className="w-full h-full object-cover"
+                    />
+                    <span className="absolute bottom-2 left-2 bg-slate-950/80 text-amber-400 border border-amber-500/30 px-2 py-0.5 text-[10px] font-semibold rounded">
+                      You
+                    </span>
+                  </div>
+                  <div className="relative bg-slate-900 rounded-lg overflow-hidden border border-slate-800">
+                    <video
+                      ref={remoteVideoRef}
+                      autoPlay
+                      playsInline
+                      className="w-full h-full object-cover"
+                    />
+                    <span className="absolute bottom-2 left-2 bg-slate-950/80 text-slate-200 border border-slate-700 px-2 py-0.5 text-[10px] font-semibold rounded truncate max-w-[80%]">
+                      {remoteUserName}
+                    </span>
                   </div>
                 </div>
               )}
 
-              {/* Video Grid */}
-              {(isInCall || Object.keys(remoteStreams).length > 0) && (
-                <div className="p-3 bg-black border-b border-slate-800 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 max-h-96 overflow-y-auto shrink-0">
-                  {isInCall && (
-                    <div className="relative bg-slate-900 rounded-lg overflow-hidden border border-slate-800 aspect-video flex items-center justify-center">
-                      <video
-                        ref={localVideoRef}
-                        autoPlay
-                        playsInline
-                        muted
-                        className={`w-full h-full object-cover ${isVideoOff ? 'hidden' : ''}`}
-                      />
-                      {isVideoOff && (
-                        <div className="absolute inset-flex items-center justify-center text-xs text-slate-400 font-semibold bg-slate-900">
-                          Camera Off / Audio Only
-                        </div>
-                      )}
-                      <span className="absolute bottom-2 left-2 bg-slate-950/80 text-amber-400 border border-amber-500/30 px-2 py-0.5 text-[10px] font-semibold rounded z-20">
-                        You {isVideoOff ? '(Audio Only)' : ''}
-                      </span>
-                    </div>
-                  )}
-
-                  {Object.entries(remoteStreams).map(([socketId, { stream, userName }]) => (
-                    <div
-                      key={socketId}
-                      className="relative bg-slate-900 rounded-lg overflow-hidden border border-slate-800 aspect-video flex items-center justify-center"
-                    >
-                      <video
-                        ref={(el) => {
-                          remoteVideoRefs.current[socketId] = el;
-                          if (el && el.srcObject !== stream) {
-                            el.srcObject = stream;
-                          }
-                        }}
-                        autoPlay
-                        playsInline
-                        className="w-full h-full object-cover"
-                      />
-
-                      <span className="absolute bottom-2 left-2 bg-slate-950/80 text-slate-200 border border-slate-700 px-2 py-0.5 text-[10px] font-semibold rounded truncate max-w-[80%] z-20">
-                        {userName}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Chat Messages */}
+              {/* Chat Messages Area with Pagination Trigger */}
               <div
                 ref={chatContainerRef}
                 onScroll={handleScroll}
@@ -987,9 +711,7 @@ export default function ChatPage() {
                     >
                       <span className="text-[11px] text-slate-400 mb-1 px-1">
                         {msg.userName || 'User'}
-                        {msg.isEdited && (
-                          <span className="ml-1 text-[9px] text-slate-500">(edited)</span>
-                        )}
+                        {msg.isEdited && <span className="ml-1 text-[9px] text-slate-500">(edited)</span>}
                       </span>
 
                       <div
@@ -1047,6 +769,7 @@ export default function ChatPage() {
                               </div>
                             )}
 
+                            {/* Edit / Delete Action Buttons for Author */}
                             {isMe && !isEditing && (
                               <div className="absolute -top-3 right-1 hidden group-hover:flex items-center bg-slate-900 border border-slate-800 rounded px-1 py-0.5 gap-1 shadow-md">
                                 <button
@@ -1115,7 +838,7 @@ export default function ChatPage() {
               </form>
             </div>
 
-            {/* Members List */}
+            {/* Right Sidebar: Active Members */}
             <div
               className={`${
                 showMobileMembers ? 'fixed inset-y-0 right-0 z-30 w-64' : 'hidden'
