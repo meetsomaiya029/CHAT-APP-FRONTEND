@@ -245,7 +245,7 @@ export default function ChatPage() {
         }
       } catch (err) {
         console.error('[WebRTC] Negotiation failed:', err);
-      } font-medium {
+      } finally {
         makingOffer = false;
       }
     };
