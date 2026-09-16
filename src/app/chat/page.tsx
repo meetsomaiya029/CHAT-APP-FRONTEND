@@ -253,7 +253,7 @@ export default function ChatPage() {
       }
     } catch (err) {
       console.error('Failed to load older messages', err);
-    } fontinally {
+    } finally{
       setIsLoadingMore(false);
     }
   };
